@@ -347,11 +347,21 @@ Contributions to improve API compatibility are welcome — please open an issue 
 
 ## License
 
-This plugin is provided as-is for the Domoticz community. See the main Domoticz project for license terms.
+This plugin is licensed under the **GNU General Public License v3** (GPLv3).
+See [LICENSE](LICENSE) for the full text.
+
+This project is a derivative work of
+[ha-gecko-integration](https://github.com/geckoal/ha-gecko-integration)
+by Gecko Alliance, which is licensed under the **Apache License 2.0**.
+In compliance with the Apache 2.0 license requirements:
+
+- A copy of the Apache 2.0 license is included as [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0).
+- The upstream NOTICE file is reproduced in [NOTICE-UPSTREAM](NOTICE-UPSTREAM).
+- Modified files carry prominent notices indicating changes (see source file headers).
 
 ## Acknowledgments
 
 - [Gecko Alliance](https://www.geckoalliance.com/) for building local-first spa equipment
+- [geckoal/ha-gecko-integration](https://github.com/geckoal/ha-gecko-integration) (Copyright 2025-2026 Gecko Alliance, Apache-2.0) for the cloud API approach this plugin is derived from
 - [gazoodle/geckolib](https://github.com/gazoodle/geckolib) for the original reverse-engineering work on the Gecko protocol
-- [geckoal/ha-gecko-integration](https://github.com/geckoal/ha-gecko-integration) for the cloud API approach
 - The Domoticz community for the Python plugin framework

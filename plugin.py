@@ -1,6 +1,6 @@
 # Gecko Spa / Hot Tub Domoticz Plugin
 #
-# Author: Domoticz community
+# Author: GizMoCuz
 #
 # Integrates Gecko Alliance spa/hot tub controllers with Domoticz.
 # Uses the same cloud API as the Home Assistant gecko integration.
@@ -8,8 +8,14 @@
 # Authentication: Auth0 OAuth2 (Resource Owner Password Grant)
 # Real-time API:  https://api.geckowatermonitor.com
 #
+# This file is a derivative work based on ha-gecko-integration
+# (https://github.com/geckoal/ha-gecko-integration)
+# Copyright 2025-2026 Gecko Alliance, licensed under the Apache License 2.0.
+# See LICENSE-APACHE-2.0 and NOTICE-UPSTREAM for the original license and notices.
+# Modifications: Rewritten for the Domoticz Python plugin framework (2025-2026).
+#
 """
-<plugin key="GeckoSpa" name="Gecko Spa / Hot Tub" author="domoticz" version="1.0.0"
+<plugin key="GeckoSpa" name="Gecko Spa / Hot Tub" author="GizMoCuz" version="1.0.0"
         wikilink="https://wiki.domoticz.com/Plugins"
         externallink="https://github.com/gizmocuz/domoticz-gecko-spa">
     <description>
