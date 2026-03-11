@@ -1,0 +1,1 @@
+# domoticz-gecko-spa
