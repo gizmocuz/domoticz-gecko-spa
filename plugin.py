@@ -86,6 +86,11 @@ def _update_device_if_changed(unit, n_value, s_value):
         device.Update(nValue=n_value, sValue=s_value)
 
 
+def _level_to_mode_idx(level):
+    """Convert a Domoticz selector level (0, 10, 20, …) to a mode list index."""
+    return int(level) // 10
+
+
 class BasePlugin:
     """Domoticz base plugin for Gecko Alliance spa control."""
 
@@ -406,16 +411,12 @@ class BasePlugin:
             except Exception as exc:
                 Domoticz.Debug(f"Could not read setpoint: {exc}")
 
-        # Water care mode
+        # Water care mode – all modes are valid active states, so always use nValue=1
         if facade.water_care is not None and UNIT_WATER_CARE in Devices:
             mode_idx = facade.water_care.active_mode
             if mode_idx is not None:
                 level = mode_idx * 10
-                _update_device_if_changed(
-                    UNIT_WATER_CARE,
-                    0 if level == 0 else 1,
-                    str(level),
-                )
+                _update_device_if_changed(UNIT_WATER_CARE, 1, str(level))
 
         # Eco mode
         if facade.eco_mode is not None and UNIT_ECO_MODE in Devices:
@@ -437,7 +438,12 @@ class BasePlugin:
                 continue
             modes = pump.modes
             mode = pump.mode
-            level = modes.index(mode) * 10 if mode in modes else 0
+            if mode not in modes:
+                Domoticz.Debug(
+                    f"Pump {pump.ui_key} mode '{mode}' not in modes {modes}; skipping update"
+                )
+                continue
+            level = modes.index(mode) * 10
             _update_device_if_changed(
                 unit, 0 if level == 0 else 1, str(level)
             )
@@ -487,8 +493,7 @@ class BasePlugin:
         # Water care mode
         elif unit == UNIT_WATER_CARE:
             if command == "Set Level":
-                mode_idx = int(level) // 10
-                facade.water_care.set_mode(mode_idx)
+                facade.water_care.set_mode(_level_to_mode_idx(level))
 
         # Eco mode
         elif unit == UNIT_ECO_MODE:
@@ -509,7 +514,7 @@ class BasePlugin:
                 return
             modes = pump.modes
             if command == "Set Level":
-                mode_idx = int(level) // 10
+                mode_idx = _level_to_mode_idx(level)
                 if 0 <= mode_idx < len(modes):
                     pump.set_mode(modes[mode_idx])
             elif command == "Off" and "OFF" in modes:
