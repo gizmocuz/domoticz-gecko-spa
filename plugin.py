@@ -681,8 +681,14 @@ class BasePlugin:
     # --- device creation ---
 
     def _create_devices(self, snap):
-        # Device names deliberately omit the spa/hardware name — Domoticz already
-        # shows the hardware in its own column on the Devices page.
+        # Device names use the SPA's own name (facade.name, e.g. "Home") as
+        # prefix, not the Domoticz hardware name. The facade name is set by
+        # the user in the in.touch app and identifies which physical spa
+        # the device belongs to.
+        spa = (snap.get("spa_name") or "Spa").strip() or "Spa"
+        def _n(label):
+            return "{} - {}".format(spa, label)
+
         if UNIT_THERMOSTAT in Devices:
             existing = Devices[UNIT_THERMOSTAT]
             if existing.Type != THERMOSTAT6_TYPE or existing.SubType != THERMOSTAT6_SUBTYPE:
@@ -692,19 +698,19 @@ class BasePlugin:
                     "combined Thermostat 6 layout.".format(
                         UNIT_THERMOSTAT, existing.Type, existing.SubType))
         else:
-            Domoticz.Device(Name="Thermostat",
+            Domoticz.Device(Name=_n("Thermostat"),
                             Unit=UNIT_THERMOSTAT,
                             Type=THERMOSTAT6_TYPE,
                             Subtype=THERMOSTAT6_SUBTYPE).Create()
         if UNIT_HEATING not in Devices:
-            Domoticz.Device(Name="Heating", Unit=UNIT_HEATING, TypeName="Switch").Create()
+            Domoticz.Device(Name=_n("Heating"), Unit=UNIT_HEATING, TypeName="Switch").Create()
 
         for i, p in enumerate(snap.get("pumps", [])):
             unit = UNIT_PUMP_BASE + i
             modes = p.get("modes") or ["OFF", "ON"]
             self._unit_meta[unit] = {"kind": "pump", "idx": i, "modes": modes}
             if unit not in Devices:
-                Domoticz.Device(Name=p.get("name") or "Pump {}".format(i + 1),
+                Domoticz.Device(Name=_n(p.get("name") or "Pump {}".format(i + 1)),
                                 Unit=unit, TypeName="Selector Switch",
                                 Options=_selector_options(modes)).Create()
 
@@ -712,7 +718,7 @@ class BasePlugin:
             unit = UNIT_LIGHT_BASE + i
             self._unit_meta[unit] = {"kind": "light", "idx": i}
             if unit not in Devices:
-                Domoticz.Device(Name=l.get("name") or "Light {}".format(i + 1),
+                Domoticz.Device(Name=_n(l.get("name") or "Light {}".format(i + 1)),
                                 Unit=unit, TypeName="Switch").Create()
 
         for i, b in enumerate(snap.get("blowers", [])):
@@ -720,7 +726,7 @@ class BasePlugin:
             modes = b.get("modes") or ["OFF", "ON"]
             self._unit_meta[unit] = {"kind": "blower", "idx": i, "modes": modes}
             if unit not in Devices:
-                Domoticz.Device(Name=b.get("name") or "Blower {}".format(i + 1),
+                Domoticz.Device(Name=_n(b.get("name") or "Blower {}".format(i + 1)),
                                 Unit=unit, TypeName="Selector Switch",
                                 Options=_selector_options(modes)).Create()
 
@@ -729,14 +735,14 @@ class BasePlugin:
         if wc_modes:
             self._unit_meta[UNIT_WATERCARE] = {"kind": "watercare", "idx": 0, "modes": wc_modes}
             if UNIT_WATERCARE not in Devices:
-                Domoticz.Device(Name="Watercare",
+                Domoticz.Device(Name=_n("Watercare"),
                                 Unit=UNIT_WATERCARE, TypeName="Selector Switch",
                                 Options=_selector_options(wc_modes)).Create()
 
         if UNIT_GATEWAY not in Devices:
-            Domoticz.Device(Name="Gateway", Unit=UNIT_GATEWAY, TypeName="Switch").Create()
+            Domoticz.Device(Name=_n("Gateway"), Unit=UNIT_GATEWAY, TypeName="Switch").Create()
         if UNIT_STATUS not in Devices:
-            Domoticz.Device(Name="Status", Unit=UNIT_STATUS, TypeName="Text").Create()
+            Domoticz.Device(Name=_n("Status"), Unit=UNIT_STATUS, TypeName="Text").Create()
 
     # --- snapshot -> device updates ---
 
