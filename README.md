@@ -43,7 +43,7 @@ Setup → Hardware → add **Gecko Spa / Hot Tub**:
 | Field | Notes |
 |---|---|
 | Spa IP | Leave blank for UDP-broadcast auto-discovery. Set to the in.touch's LAN IP if discovery is blocked (different VLAN, firewall, etc.). |
-| Poll interval | How often Domoticz reads the cached snapshot (every 10 s heartbeat × N). |
+| Poll interval | How often Domoticz reads the cached snapshot (10 / 30 / 60 / 120 seconds). |
 | Debug | `All` (-1) enables geckolib's own trace logging too. |
 
 On first start the plugin connects, enumerates the spa, and creates the devices. Look for log lines like:

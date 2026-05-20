@@ -9,7 +9,7 @@
 # Requires: pip install geckolib
 #
 """
-<plugin key="GeckoSpa" name="Gecko Spa / Hot Tub" author="GizMoCuz" version="2.0.0"
+<plugin key="GeckoSpa" name="Gecko Spa / Hot Tub" author="GizMoCuz" version="2.0.1"
         wikilink="https://wiki.domoticz.com/Plugins"
         externallink="https://github.com/gizmocuz/domoticz-gecko-spa">
     <description>
@@ -30,12 +30,12 @@
     </description>
     <params>
         <param field="Address" label="Spa IP (blank = auto-discover)" width="200px" required="false"/>
-        <param field="Mode1" label="Poll interval (heartbeats)" width="75px" required="false" default="3">
+        <param field="Mode1" label="Poll interval" width="100px" required="false" default="30">
             <options>
-                <option label="Every heartbeat (~10s)" value="1"/>
-                <option label="Every 3 heartbeats (~30s)" value="3" default="true"/>
-                <option label="Every 6 heartbeats (~60s)" value="6"/>
-                <option label="Every 12 heartbeats (~2min)" value="12"/>
+                <option label="10 seconds" value="10"/>
+                <option label="30 seconds" value="30" default="true"/>
+                <option label="60 seconds" value="60"/>
+                <option label="120 seconds" value="120"/>
             </options>
         </param>
         <param field="Mode6" label="Debug" width="150px">
@@ -432,7 +432,7 @@ class BasePlugin:
 
     def __init__(self):
         self._bridge = None
-        self._poll_interval = 3
+        self._poll_interval = 3  # in heartbeats (10s each); set from Mode1 seconds at onStart
         self._heartbeat_count = 0
         self._devices_created = False
         # Per-unit metadata for command dispatch and selector mode lookup:
@@ -446,10 +446,13 @@ class BasePlugin:
         if dbg and dbg != "0":
             Domoticz.Debugging(int(dbg))
 
+        # Mode1 is the poll interval in seconds (10/30/60/120). Domoticz heartbeat
+        # ticks every 10s, so divide to get how many heartbeats per poll.
         try:
-            self._poll_interval = max(1, int(Parameters.get("Mode1", "3")))
+            poll_seconds = max(10, int(Parameters.get("Mode1", "30")))
         except ValueError:
-            self._poll_interval = 3
+            poll_seconds = 30
+        self._poll_interval = max(1, poll_seconds // 10)
 
         Domoticz.Heartbeat(10)
 
@@ -465,8 +468,8 @@ class BasePlugin:
             logging.DEBUG if dbg and dbg != "0" else logging.WARNING)
 
         spa_ip = (Parameters.get("Address") or "").strip() or None
-        Domoticz.Log("Starting Gecko Spa plugin. Spa IP={}, poll every {} heartbeats.".format(
-            spa_ip or "(auto-discover)", self._poll_interval))
+        Domoticz.Log("Starting Gecko Spa plugin. Spa IP={}, poll every {}s.".format(
+            spa_ip or "(auto-discover)", poll_seconds))
 
         self._bridge = GeckoBridge()
         self._bridge.start(spa_ip)
