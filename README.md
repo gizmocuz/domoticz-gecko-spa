@@ -18,23 +18,48 @@ Devices are created **dynamically from the live spa**. A spa with 3 pumps and 1 
 
 - Domoticz with Python plugin support
 - Python 3.10+ (matches Domoticz's bundled Python on Windows)
-- [`geckolib`](https://pypi.org/project/geckolib/) installed **into the same Python interpreter that Domoticz uses** — not just any system Python:
-  ```
-  pip install geckolib
-  ```
-  If `pip` runs against a different interpreter, the plugin will fail at startup with `geckolib is not installed for Domoticz's Python`. To target the right one, invoke pip via the Domoticz Python explicitly, e.g.:
-  ```
-  "C:\Path\To\Domoticz\python.exe" -m pip install geckolib       # Windows
-  /usr/bin/python3 -m pip install geckolib                       # Linux (matches the python3 Domoticz was built against)
-  ```
-  The interpreter path is whatever Domoticz was configured to use at build time (CMake `-DPYTHON_EXECUTABLE=...`) or, on Windows, the Python whose DLL Domoticz loads at startup. Setup → Settings → System will show the detected Python version.
+- The [`geckolib`](https://pypi.org/project/geckolib/) library (installed in step 2 below)
 - Domoticz host and the spa's in.touch module on the same LAN (UDP broadcast for auto-discovery, or a routable IP)
 
 ## Install
 
-1. Drop this folder into `domoticz/plugins/GeckoSpa/`.
-2. `pip install geckolib` in the same Python that Domoticz uses.
-3. Restart Domoticz.
+### 1. Clone the plugin into Domoticz's `plugins/` folder
+
+```
+cd plugins
+git clone https://github.com/gizmocuz/domoticz-gecko-spa.git Gecko
+```
+
+The folder name (`Gecko`) is up to you — Domoticz identifies plugins by the `key="GeckoSpa"` attribute in the XML, not by directory name. Pick whatever you'd like to see in the filesystem.
+
+### 2. Install `geckolib` for Domoticz's Python
+
+`geckolib` must end up in the **same Python interpreter that Domoticz loads**, not just any system Python. If it lands in the wrong one, the plugin fails at startup with `geckolib is not installed for Domoticz's Python`. Setup → Settings → System shows the version Domoticz actually detected.
+
+**Native install (Linux / macOS / Windows):**
+
+```
+pip install geckolib
+```
+
+If `pip` resolves to a different interpreter than Domoticz uses, invoke pip via Domoticz's Python explicitly:
+
+```
+/usr/bin/python3 -m pip install geckolib                      # Linux
+"C:\Path\To\Domoticz\python.exe" -m pip install geckolib      # Windows
+```
+
+**Docker / docker-compose:**
+
+The container is rebuilt from a clean image on every restart, so installing `geckolib` interactively inside the container won't survive. Add it to `customstart.sh` (the Domoticz container's per-start hook) so it's reinstalled on every boot:
+
+```sh
+pip3 install geckolib
+```
+
+### 3. Restart Domoticz
+
+After restart, add the hardware (see *Set up* below).
 
 ## Set up
 
