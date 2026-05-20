@@ -526,6 +526,10 @@ class BasePlugin:
         # Per-unit metadata for command dispatch and selector mode lookup:
         # unit -> {"kind": "pump"/"light"/"blower"/"watercare", "idx": int, "modes": [..]}
         self._unit_meta = {}
+        # Set by onCommand to make the next heartbeat push a full snapshot,
+        # so users don't have to wait up to poll_interval for a command to
+        # be visually confirmed against the spa's actual state.
+        self._force_next_push = False
 
     # --- lifecycle ---
 
@@ -587,13 +591,18 @@ class BasePlugin:
             self._create_devices(snap)
             self._devices_created = True
 
-        if self._heartbeat_count % self._poll_interval == 0:
+        if self._force_next_push or (self._heartbeat_count % self._poll_interval == 0):
+            self._force_next_push = False
             self._push_snapshot_to_devices(snap)
 
     def onCommand(self, Unit, Command, Level, Hue):
         Domoticz.Debug("onCommand Unit={} Command={} Level={}".format(Unit, Command, Level))
         if self._bridge is None:
             return
+        # Any successful command schedules a full snapshot push on the next
+        # heartbeat (≤10s) so the user sees spa-confirmed state quickly.
+        # _push_snapshot_to_devices is a no-op when values haven't changed.
+        self._force_next_push = True
 
         if Unit == UNIT_THERMOSTAT:
             # Setpoint commands on a Thermostat 6 arrive as Command="Set Level",
