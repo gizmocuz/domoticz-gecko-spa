@@ -73,10 +73,12 @@ import Domoticz
 
 try:
     from geckolib import GeckoAsyncSpaMan, GeckoSpaEvent, GeckoSpaState
+    import geckolib.config as _gecko_config
 except ImportError as _ie:
     GeckoAsyncSpaMan = None  # type: ignore
     GeckoSpaEvent = None     # type: ignore
     GeckoSpaState = None     # type: ignore
+    _gecko_config = None     # type: ignore
     _import_error = _ie
 else:
     _import_error = None
@@ -281,6 +283,18 @@ class GeckoBridge:
         self._stop_event = asyncio.Event()
         if self._stop_requested:
             self._stop_event.set()
+
+        # geckolib has a module-level asyncio.Event (ConfigChangeEvent at
+        # geckolib/config.py:81) created at import time. asyncio.Event lazily
+        # binds to the first running loop it's used on, so after a
+        # disable+enable cycle this stale Event still points at the previous
+        # (closed) loop and any internal await on it raises
+        # "is bound to a different event loop". Recreate it for the new loop.
+        if _gecko_config is not None:
+            try:
+                _gecko_config.ConfigChangeEvent = asyncio.Event()
+            except Exception as e:
+                Domoticz.Debug("Could not reset geckolib ConfigChangeEvent: {}".format(e))
 
         async with _SpaMan(CLIENT_ID, _on_event) as spaman:
             self._spaman = spaman
