@@ -40,8 +40,12 @@ def _build_domoticz_stub():
             self._kw = kw
             self.nValue = 0
             self.sValue = ""
+            # Mirror the Domoticz device attributes the plugin reads.
+            self.Type    = kw.get("Type", 0)
+            self.SubType = kw.get("Subtype", kw.get("SubType", 0))
         def Create(self):
-            print(f"[CREATE] {self._kw.get('Name')} unit={self._kw.get('Unit')} type={self._kw.get('TypeName') or self._kw.get('Type')}")
+            label = self._kw.get("TypeName") or "Type={}/SubType={}".format(self.Type, self.SubType)
+            print(f"[CREATE] {self._kw.get('Name')} unit={self._kw.get('Unit')} {label}")
             DEVICES[self._kw["Unit"]] = self
         def Update(self, nValue=0, sValue=""):
             self.nValue, self.sValue = nValue, sValue

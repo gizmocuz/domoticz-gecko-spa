@@ -8,10 +8,20 @@
 #
 # Requires: pip install geckolib
 #
+# NOTE on shared="true" in the plugin tag below: this plugin MUST run in
+# Domoticz's main interpreter, not in a private Py_NewInterpreter() sub-
+# interpreter. geckolib's asyncio + threading usage triggers Python "dummy"
+# thread state on Domoticz's own host threads, which prevents
+# Py_EndInterpreter from completing on hardware disable. The stalled
+# teardown then holds MainWorker::m_devicemutex, and any subsequent
+# enable hangs the whole Domoticz UI in MainWorker::GetHardware().
+# Removing shared="true" will reintroduce that deadlock.
+#
 """
-<plugin key="GeckoSpa" name="Gecko Spa / Hot Tub" author="GizMoCuz" version="2.0.1"
+<plugin key="GeckoSpa" name="Gecko Spa / Hot Tub" author="GizMoCuz" version="2.1.0"
         wikilink="https://wiki.domoticz.com/Plugins"
-        externallink="https://github.com/gizmocuz/domoticz-gecko-spa">
+        externallink="https://github.com/gizmocuz/domoticz-gecko-spa"
+        shared="true">
     <description>
         <h2>Gecko Spa Plugin (LAN)</h2><br/>
         Controls Gecko Alliance spas locally via the in.touch 2 / in.touch 3
@@ -57,6 +67,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import Domoticz
 
@@ -74,8 +85,8 @@ else:
 # Unit layout (single spa)
 # ---------------------------------------------------------------------------
 
-UNIT_WATER_TEMP = 1
-UNIT_SETPOINT   = 2
+UNIT_THERMOSTAT = 1   # Combined Thermostat 6 (Type=73 Subtype=0): "temp;setpoint"
+# (unit 2 was previously a stand-alone Setpoint; retired in v2.1.0)
 UNIT_HEATING    = 3
 # 4..7 = pumps[0..3]
 # 8..11 = lights[0..3]
@@ -86,6 +97,10 @@ UNIT_BLOWER_BASE = 12
 UNIT_WATERCARE   = 16
 UNIT_GATEWAY     = 17
 UNIT_STATUS      = 18
+
+# Domoticz device-type constants
+THERMOSTAT6_TYPE    = 73   # pTypeThermostat6
+THERMOSTAT6_SUBTYPE = 0    # sTypeThermostat6Temp -> sValue "temp;setpoint"
 
 MAX_PUMPS   = 4
 MAX_LIGHTS  = 4
@@ -136,7 +151,16 @@ class GeckoBridge:
         self._loop = None
         self._thread = None
         self._spaman = None
+        # _stop_event is created on the bridge loop in _run(); _stop_requested
+        # is the fallback flag for the brief window before the event exists.
+        self._stop_event = None
         self._stop_requested = False
+        # We install our own ThreadPoolExecutor as the loop's default so we
+        # can force-cancel its workers at shutdown. asyncio's default executor
+        # cannot be reliably joined under Domoticz's Py_NewInterpreter
+        # sub-interpreter, leading to "Plugin has 1 Python threads still
+        # running" loops.
+        self._executor = None
 
         # Latest snapshot; updated from the bridge thread, read from Domoticz thread.
         self._lock = threading.Lock()
@@ -175,11 +199,19 @@ class GeckoBridge:
         self._thread.start()
 
     def stop(self):
-        # Let the coroutine notice and exit cleanly so geckolib can cancel its
-        # own tasks before the loop closes. Don't force-stop the loop.
+        # Signal both: the asyncio Event (wakes any in-flight sleep) and the
+        # plain flag the polling loop checks each iteration.
         self._stop_requested = True
+        loop, event = self._loop, self._stop_event
+        if loop is not None and event is not None:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass
         if self._thread is not None:
-            self._thread.join(timeout=15)
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                Domoticz.Error("Gecko bridge thread did not exit within 5s; abandoning (daemon).")
             self._thread = None
 
     def _thread_main(self, spa_ip):
@@ -188,23 +220,67 @@ class GeckoBridge:
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        # Install our own executor so we can join its workers at shutdown.
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gecko-io")
+        self._loop.set_default_executor(self._executor)
         try:
             self._loop.run_until_complete(self._run(spa_ip))
         except Exception as e:
             Domoticz.Error("Gecko bridge thread crashed: {}".format(e))
         finally:
+            Domoticz.Debug("bridge: _run returned, cleaning up...")
+            # Cancel any tasks geckolib left behind so loop.close() doesn't block.
+            # Wrap the gather in wait_for so a task that swallows CancelledError
+            # cannot stall shutdown indefinitely.
+            try:
+                pending = [t for t in asyncio.all_tasks(self._loop) if not t.done()]
+                if pending:
+                    Domoticz.Debug("bridge: cancelling {} pending asyncio task(s)".format(len(pending)))
+                    for t in pending:
+                        t.cancel()
+                    try:
+                        self._loop.run_until_complete(
+                            asyncio.wait_for(
+                                asyncio.gather(*pending, return_exceptions=True),
+                                timeout=2))
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        Domoticz.Debug("bridge: pending task drain timed out (continuing)")
+            except Exception as e:
+                Domoticz.Debug("bridge: task drain raised {}".format(e))
+
+            # Shut down our own executor — geckolib schedules blocking I/O via
+            # loop.run_in_executor(None, ...) and we install our own so we can
+            # cancel pending futures + join the workers deterministically.
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+            except Exception as e:
+                Domoticz.Debug("bridge: executor shutdown raised {}".format(e))
+
             try:
                 self._loop.close()
-            except Exception:
-                pass
+            except Exception as e:
+                Domoticz.Debug("bridge: loop.close raised {}".format(e))
             self._loop = None
+            self._executor = None
+            self._stop_event = None
+            Domoticz.Debug("bridge: thread exiting.")
 
     async def _run(self, spa_ip):
+        # Events that fire every couple of seconds; useless in the log.
+        _silent_events = {"RUNNING_PING_RECEIVED"}
+
         def _on_event(event, state):
             name = getattr(event, "name", str(event))
             with self._lock:
                 self._snap["spa_state"] = getattr(state, "name", str(state))
+            if name in _silent_events:
+                return
             Domoticz.Debug("geckolib event {} (state={})".format(name, getattr(state, "name", state)))
+
+        # Now that we have a running loop, create the stop-event on it.
+        self._stop_event = asyncio.Event()
+        if self._stop_requested:
+            self._stop_event.set()
 
         async with _SpaMan(CLIENT_ID, _on_event) as spaman:
             self._spaman = spaman
@@ -230,12 +306,17 @@ class GeckoBridge:
             Domoticz.Log("Spa found: {} @ {} ({})".format(d.name, d.ipaddress, d.identifier_as_string))
             await spaman.async_set_spa_info(d.ipaddress, d.identifier_as_string, d.name)
 
-            # Wait for connection (facade ready) up to 60s
+            # Wait for connection (facade ready) up to 60s, or until stop requested.
             deadline = time.time() + 60
             while time.time() < deadline:
-                if spaman.facade is not None:
+                if spaman.facade is not None or self._stop_event.is_set():
                     break
-                await asyncio.sleep(0.5)
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+            if self._stop_event.is_set():
+                return
             if spaman.facade is None:
                 Domoticz.Error("Timed out waiting for spa facade (state={}).".format(spaman.spa_state))
                 return
@@ -254,11 +335,18 @@ class GeckoBridge:
             ))
 
             # Refresh loop — geckolib pushes updates internally via the protocol,
-            # so we just periodically snapshot the facade.
-            while not self._stop_requested:
+            # so we just periodically snapshot the facade. Wait on the stop event
+            # so onStop() can wake us immediately instead of after the full 5s.
+            # Also check _stop_requested directly as a belt-and-braces backup for
+            # the case where call_soon_threadsafe(event.set) is delayed across
+            # sub-interpreter boundaries (Domoticz runs plugins under
+            # Py_NewInterpreter, where cross-thread asyncio signalling is flakier).
+            while not (self._stop_event.is_set() or self._stop_requested):
                 self._refresh_snapshot()
                 try:
-                    await asyncio.sleep(5)
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    pass
                 except asyncio.CancelledError:
                     break
 
@@ -507,14 +595,21 @@ class BasePlugin:
         if self._bridge is None:
             return
 
-        if Unit == UNIT_SETPOINT:
+        if Unit == UNIT_THERMOSTAT:
+            # Setpoint commands on a Thermostat 6 arrive as Command="Set Level",
+            # Level=<temperature in °C>.
             try:
                 temp = float(Level)
             except (TypeError, ValueError):
                 Domoticz.Error("Setpoint requires a numeric level, got {}".format(Level))
                 return
             self._bridge.set_setpoint(temp)
-            _update(UNIT_SETPOINT, 0, "{:.1f}".format(temp))
+            # Optimistically reflect the new setpoint; the next snapshot push will
+            # confirm with the actual reading.
+            snap = self._bridge.snapshot()
+            current = snap.get("water_temp")
+            t = "{:.1f}".format(current) if current is not None else ""
+            _update(UNIT_THERMOSTAT, 0, "{};{:.1f}".format(t, temp))
             return
 
         meta = self._unit_meta.get(Unit)
@@ -563,24 +658,30 @@ class BasePlugin:
     # --- device creation ---
 
     def _create_devices(self, snap):
-        name = snap.get("spa_name") or "Spa"
-
-        if UNIT_WATER_TEMP not in Devices:
-            Domoticz.Device(Name="{} - Water Temperature".format(name),
-                            Unit=UNIT_WATER_TEMP, TypeName="Temperature").Create()
-        if UNIT_SETPOINT not in Devices:
-            Domoticz.Device(Name="{} - Setpoint".format(name),
-                            Unit=UNIT_SETPOINT, Type=242, SubType=1).Create()
+        # Device names deliberately omit the spa/hardware name — Domoticz already
+        # shows the hardware in its own column on the Devices page.
+        if UNIT_THERMOSTAT in Devices:
+            existing = Devices[UNIT_THERMOSTAT]
+            if existing.Type != THERMOSTAT6_TYPE or existing.SubType != THERMOSTAT6_SUBTYPE:
+                Domoticz.Error(
+                    "Unit {} exists but is not a Thermostat 6 device (Type={}, SubType={}). "
+                    "Delete it in Setup -> Devices and restart the hardware to migrate to the "
+                    "combined Thermostat 6 layout.".format(
+                        UNIT_THERMOSTAT, existing.Type, existing.SubType))
+        else:
+            Domoticz.Device(Name="Thermostat",
+                            Unit=UNIT_THERMOSTAT,
+                            Type=THERMOSTAT6_TYPE,
+                            Subtype=THERMOSTAT6_SUBTYPE).Create()
         if UNIT_HEATING not in Devices:
-            Domoticz.Device(Name="{} - Heating".format(name),
-                            Unit=UNIT_HEATING, TypeName="Switch").Create()
+            Domoticz.Device(Name="Heating", Unit=UNIT_HEATING, TypeName="Switch").Create()
 
         for i, p in enumerate(snap.get("pumps", [])):
             unit = UNIT_PUMP_BASE + i
             modes = p.get("modes") or ["OFF", "ON"]
             self._unit_meta[unit] = {"kind": "pump", "idx": i, "modes": modes}
             if unit not in Devices:
-                Domoticz.Device(Name="{} - {}".format(name, p.get("name") or "Pump {}".format(i + 1)),
+                Domoticz.Device(Name=p.get("name") or "Pump {}".format(i + 1),
                                 Unit=unit, TypeName="Selector Switch",
                                 Options=_selector_options(modes)).Create()
 
@@ -588,7 +689,7 @@ class BasePlugin:
             unit = UNIT_LIGHT_BASE + i
             self._unit_meta[unit] = {"kind": "light", "idx": i}
             if unit not in Devices:
-                Domoticz.Device(Name="{} - {}".format(name, l.get("name") or "Light {}".format(i + 1)),
+                Domoticz.Device(Name=l.get("name") or "Light {}".format(i + 1),
                                 Unit=unit, TypeName="Switch").Create()
 
         for i, b in enumerate(snap.get("blowers", [])):
@@ -596,7 +697,7 @@ class BasePlugin:
             modes = b.get("modes") or ["OFF", "ON"]
             self._unit_meta[unit] = {"kind": "blower", "idx": i, "modes": modes}
             if unit not in Devices:
-                Domoticz.Device(Name="{} - {}".format(name, b.get("name") or "Blower {}".format(i + 1)),
+                Domoticz.Device(Name=b.get("name") or "Blower {}".format(i + 1),
                                 Unit=unit, TypeName="Selector Switch",
                                 Options=_selector_options(modes)).Create()
 
@@ -605,24 +706,26 @@ class BasePlugin:
         if wc_modes:
             self._unit_meta[UNIT_WATERCARE] = {"kind": "watercare", "idx": 0, "modes": wc_modes}
             if UNIT_WATERCARE not in Devices:
-                Domoticz.Device(Name="{} - Watercare".format(name),
+                Domoticz.Device(Name="Watercare",
                                 Unit=UNIT_WATERCARE, TypeName="Selector Switch",
                                 Options=_selector_options(wc_modes)).Create()
 
         if UNIT_GATEWAY not in Devices:
-            Domoticz.Device(Name="{} - Gateway".format(name),
-                            Unit=UNIT_GATEWAY, TypeName="Switch").Create()
+            Domoticz.Device(Name="Gateway", Unit=UNIT_GATEWAY, TypeName="Switch").Create()
         if UNIT_STATUS not in Devices:
-            Domoticz.Device(Name="{} - Status".format(name),
-                            Unit=UNIT_STATUS, TypeName="Text").Create()
+            Domoticz.Device(Name="Status", Unit=UNIT_STATUS, TypeName="Text").Create()
 
     # --- snapshot -> device updates ---
 
     def _push_snapshot_to_devices(self, snap):
-        if snap.get("water_temp") is not None:
-            _update(UNIT_WATER_TEMP, 0, "{:.1f}".format(snap["water_temp"]))
-        if snap.get("setpoint") is not None:
-            _update(UNIT_SETPOINT, 0, "{:.1f}".format(snap["setpoint"]))
+        # Combined Thermostat 6: sValue = "temp;setpoint"
+        temp = snap.get("water_temp")
+        setp = snap.get("setpoint")
+        if temp is not None or setp is not None:
+            # Fall back to the other value if one side is briefly missing
+            t = "{:.1f}".format(temp) if temp is not None else ""
+            s = "{:.1f}".format(setp) if setp is not None else ""
+            _update(UNIT_THERMOSTAT, 0, "{};{}".format(t, s))
         if snap.get("heating") is not None:
             _update(UNIT_HEATING, 1 if snap["heating"] else 0,
                     "On" if snap["heating"] else "Off")

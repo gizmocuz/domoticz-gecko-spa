@@ -47,13 +47,17 @@ Key design points:
 - **Snapshot, not callbacks.** geckolib pushes state changes internally; the bridge polls `facade` every 5s and stuffs a flat dict behind a lock. `onHeartbeat` reads that dict (no async, no blocking) and pushes to Domoticz. Avoids cross-thread Domoticz API calls.
 - **Dynamic device layout.** Devices are created from what `facade.pumps / lights / blowers / water_care` actually report — modes for selector switches come straight from `entity.modes` (e.g. `['OFF','LO','HI']` for pumps vs `['OFF','ON']` for a waterfall). Don't hardcode counts or speed labels.
 - **Unit numbering** (single-spa block):
-  - `1` Water temp, `2` Setpoint, `3` Heating
+  - `1` Thermostat 6 (combined current temp + setpoint; Type 73 SubType 0; sValue `"temp;setpoint"`; setpoint command arrives as `Set Level` with `Level=<°C>`)
+  - `2` (retired — was the stand-alone Setpoint pre-2.1.0)
+  - `3` Heating
   - `4..7` pumps (max 4)
   - `8..11` lights (max 4)
   - `12..15` blowers (max 4)
   - `16` Watercare, `17` Gateway connected, `18` Status text
 - **Windows quirk.** Python 3.13's default Proactor asyncio loop can't send UDP broadcasts (`WinError 10022`). The bridge thread switches to `WindowsSelectorEventLoopPolicy` before creating its loop. Don't remove that branch.
 - **Stable client UUID.** `CLIENT_ID` is hard-coded so the transmitter recognises repeat connections instead of accumulating fresh client entries on every restart.
+- **`shared="true"` is mandatory** (set in the `<plugin>` XML). Without it, Domoticz runs each plugin in a `Py_NewInterpreter()` sub-interpreter. geckolib's `loop.run_in_executor(None, ...)` plus the foreign Python `_DummyThread` instances that Domoticz's own C++ host threads create combine to prevent `Py_EndInterpreter` from completing when the hardware is disabled. The stalled teardown holds `MainWorker::m_devicemutex`, so the next enable click freezes the entire Domoticz UI inside `MainWorker::GetHardware()`. Switching to the shared interpreter sidesteps the whole teardown cascade. The trade-off is shared `sys.modules` / asyncio policy / logging config with other Python plugins, which is fine here (network-only, single instance).
+- **Executor lifecycle.** We install our own `ThreadPoolExecutor` as the loop's default executor and `shutdown(wait=True, cancel_futures=True)` it explicitly at shutdown. asyncio's default executor cannot be reliably joined under sub-interpreters; even under the shared interpreter, owning the executor lets us deterministically cancel queued geckolib I/O at stop time.
 
 ## Conventions
 

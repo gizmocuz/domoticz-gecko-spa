@@ -6,11 +6,11 @@ Built on top of [geckolib](https://github.com/gazoodle/geckolib), which reverse-
 
 ## What it does
 
-- Current water temperature + setpoint (read/write thermostat)
+- Combined **Thermostat 6** device showing current water temperature + setpoint in one tile (read + write the target temp from the same widget)
 - Heating-active indicator
 - One Domoticz switch per pump, light, and blower the spa actually reports — with the speed levels the controller exposes (e.g. `OFF/LO/HI` for jets, `OFF/ON` for a waterfall)
 - Watercare mode selector (Away From Home / Standard / Energy Saving / Super Energy Saving / Weekender)
-- Gateway-connected switch and status text
+- Gateway-connected switch and status text (both read-only — see note below)
 
 Devices are created **dynamically from the live spa**. A spa with 3 pumps and 1 light gets exactly that — no empty placeholders.
 
@@ -73,6 +73,8 @@ See `Tests/README.md` for details.
 - One spa per hardware entry (the first one found). Multi-spa setups would need separate hardware entries — not currently implemented.
 - The plugin uses a fixed client UUID so the transmitter recognises repeat connections instead of accumulating fresh client entries.
 - The Watercare mode list comes from your spa — names may differ from the table above on older/newer firmware.
+- The **Gateway** device is a Domoticz Switch but is *read-only*: it reflects whether the in.touch transmitter is currently reachable on the LAN (`On` ⇢ `CONNECTED`, `Off` ⇢ any other state). The plugin has no `onCommand` handler for it, so toggling it from the Domoticz UI does nothing to the spa — the next poll will just overwrite the UI back to the real state. The same information is also visible in plaintext on the **Status** device.
+- The plugin is declared with `shared="true"`, which makes it run in Domoticz's main Python interpreter instead of a private sub-interpreter. This is **required**: without it, geckolib's async/thread usage prevents `Py_EndInterpreter` from completing on hardware disable, which then deadlocks the next enable inside Domoticz's `MainWorker::GetHardware()` (frozen UI). The trade-off is that the plugin shares the Python interpreter with other Python plugins — `sys.modules`, asyncio policy, and the root logger are all process-wide. For this plugin (network-only, one instance per Domoticz install) that's harmless.
 
 ## Why local instead of cloud
 
