@@ -8,20 +8,23 @@
 #
 # Requires: pip install geckolib
 #
-# NOTE on shared="true" in the plugin tag below: this plugin MUST run in
-# Domoticz's main interpreter, not in a private Py_NewInterpreter() sub-
-# interpreter. geckolib's asyncio + threading usage triggers Python "dummy"
-# thread state on Domoticz's own host threads, which prevents
-# Py_EndInterpreter from completing on hardware disable. The stalled
-# teardown then holds MainWorker::m_devicemutex, and any subsequent
-# enable hangs the whole Domoticz UI in MainWorker::GetHardware().
-# Removing shared="true" will reintroduce that deadlock.
+# Runs in a private sub-interpreter (no shared="true"). Clean disable
+# depends on two things being in place:
+#   1. Domoticz core filtering _DummyThread out of PythonThreadCount()
+#      (hardware/plugins/Plugins.cpp). Without that, every host thread
+#      that ever called into this interpreter via PyGILState_Ensure
+#      shows up as a phantom thread on shutdown and Domoticz logs
+#      "Plugin has N Python threads still running" for 10s.
+#   2. The bridge teardown sequence in GeckoBridge._thread_main:
+#      cancel tasks -> sleep(0) yield -> shutdown_asyncgens ->
+#      shutdown_default_executor(timeout) -> close proactor (defensive)
+#      -> close loop. The asyncio-supervised executor drain is what
+#      keeps a worker blocked in geckolib I/O from stalling the join.
 #
 """
 <plugin key="GeckoSpa" name="Gecko Spa / Hot Tub" author="GizMoCuz" version="2.1.0"
         wikilink="https://wiki.domoticz.com/Plugins"
-        externallink="https://github.com/gizmocuz/domoticz-gecko-spa"
-        shared="true">
+        externallink="https://github.com/gizmocuz/domoticz-gecko-spa">
     <description>
         <h2>Gecko Spa Plugin (LAN)</h2><br/>
         Controls Gecko Alliance spas locally via the in.touch 2 / in.touch 3
@@ -157,11 +160,10 @@ class GeckoBridge:
         # is the fallback flag for the brief window before the event exists.
         self._stop_event = None
         self._stop_requested = False
-        # We install our own ThreadPoolExecutor as the loop's default so we
-        # can force-cancel its workers at shutdown. asyncio's default executor
-        # cannot be reliably joined under Domoticz's Py_NewInterpreter
-        # sub-interpreter, leading to "Plugin has 1 Python threads still
-        # running" loops.
+        # We install our own ThreadPoolExecutor as the loop's default so the
+        # asyncio-supervised shutdown_default_executor() drains its workers
+        # within a bounded timeout, even when geckolib has work parked in a
+        # blocking call. Drives the "executor drain" step in _thread_main.
         self._executor = None
 
         # Latest snapshot; updated from the bridge thread, read from Domoticz thread.
@@ -211,9 +213,12 @@ class GeckoBridge:
             except RuntimeError:
                 pass
         if self._thread is not None:
-            self._thread.join(timeout=5)
+            # Match Domoticz's own 10s "Plugin has N Python threads still
+            # running" wait window so a clean cleanup finishes in time and
+            # active_count() drops to 1 before Domoticz starts logging.
+            self._thread.join(timeout=10)
             if self._thread.is_alive():
-                Domoticz.Error("Gecko bridge thread did not exit within 5s; abandoning (daemon).")
+                Domoticz.Error("Gecko bridge thread did not exit within 10s; abandoning (daemon).")
             self._thread = None
 
     def _thread_main(self, spa_ip):
@@ -231,15 +236,28 @@ class GeckoBridge:
             Domoticz.Error("Gecko bridge thread crashed: {}".format(e))
         finally:
             Domoticz.Debug("bridge: _run returned, cleaning up...")
-            # Cancel any tasks geckolib left behind so loop.close() doesn't block.
-            # Wrap the gather in wait_for so a task that swallows CancelledError
-            # cannot stall shutdown indefinitely.
+            # Shutdown sequence mirrors the proven order from the MeshCore
+            # plugin: cancel → yield (sleep(0)) so CancelledError propagates
+            # → shutdown_asyncgens → shutdown_default_executor → close
+            # proactor → close loop. Each step is wrapped so a single
+            # failure doesn't strand the thread; the goal is for
+            # threading.active_count() to drop to 1 before stop()'s join
+            # returns, otherwise Domoticz logs "Plugin has N Python threads
+            # still running" and the next enable can race the teardown.
             try:
                 pending = [t for t in asyncio.all_tasks(self._loop) if not t.done()]
                 if pending:
                     Domoticz.Debug("bridge: cancelling {} pending asyncio task(s)".format(len(pending)))
                     for t in pending:
                         t.cancel()
+                    # One scheduler tick so the cancellations actually fire
+                    # before the gather — without this a task that's parked
+                    # on a Future never observes the cancel and gather hits
+                    # its timeout for no reason.
+                    try:
+                        self._loop.run_until_complete(asyncio.sleep(0))
+                    except Exception:
+                        pass
                     try:
                         self._loop.run_until_complete(
                             asyncio.wait_for(
@@ -250,13 +268,48 @@ class GeckoBridge:
             except Exception as e:
                 Domoticz.Debug("bridge: task drain raised {}".format(e))
 
-            # Shut down our own executor — geckolib schedules blocking I/O via
-            # loop.run_in_executor(None, ...) and we install our own so we can
-            # cancel pending futures + join the workers deterministically.
+            # Async generators (geckolib uses them in a few protocol paths)
+            # must be closed on this loop or close() leaves their __aexit__
+            # cleanup unrun.
             try:
-                self._executor.shutdown(wait=True, cancel_futures=True)
+                self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            except Exception as e:
+                Domoticz.Debug("bridge: shutdown_asyncgens raised {}".format(e))
+
+            # Shut the default executor down via the loop. We installed our
+            # own as default earlier, so this drains gecko-io workers
+            # through the asyncio-supervised path instead of a raw
+            # executor.shutdown(wait=True) which can block forever on a
+            # worker stuck inside a blocking geckolib I/O call.
+            try:
+                if hasattr(self._loop, "shutdown_default_executor"):
+                    # 3s cap matches Domoticz's overall 10s grace window
+                    # (this + sleep(0) + gather(timeout=2) + misc < 10s).
+                    try:
+                        self._loop.run_until_complete(
+                            self._loop.shutdown_default_executor(timeout=3.0))
+                    except TypeError:
+                        # Python <3.12: no timeout parameter.
+                        self._loop.run_until_complete(self._loop.shutdown_default_executor())
+                else:
+                    # Pre-3.9 fallback (shouldn't hit on supported Domoticz).
+                    self._executor.shutdown(wait=True, cancel_futures=True)
             except Exception as e:
                 Domoticz.Debug("bridge: executor shutdown raised {}".format(e))
+
+            # On Windows the ProactorEventLoop owns an IOCP with its own
+            # native completion thread; CPython surfaces it as Dummy-N once
+            # it calls back into Python. We force the selector policy on
+            # win32 (see _thread_main) so this should be a no-op, but keep
+            # it as belt-and-braces — if anything ever flipped policy back
+            # (e.g. a 3rd-party import), this is what stops the dummy
+            # thread from outliving the loop and inflating active_count().
+            try:
+                proactor = getattr(self._loop, "_proactor", None)
+                if proactor is not None:
+                    proactor.close()
+            except Exception as e:
+                Domoticz.Debug("bridge: proactor close raised {}".format(e))
 
             try:
                 self._loop.close()
@@ -265,6 +318,7 @@ class GeckoBridge:
             self._loop = None
             self._executor = None
             self._stop_event = None
+
             Domoticz.Debug("bridge: thread exiting.")
 
     async def _run(self, spa_ip):
