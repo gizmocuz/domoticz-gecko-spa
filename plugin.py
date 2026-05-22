@@ -8,6 +8,11 @@
 #
 # Requires: pip install geckolib
 #
+# Uses the DomoticzEx device model (DeviceID + Units sub-dict): a single
+# Device represents the spa, with each entity (thermostat, heating, pumps,
+# lights, blowers, watercare, gateway, status) as a Unit under it. DeviceID
+# is the spa's stable unique_id (e.g. "SPAe8:eb:1b:3b:b1:46").
+#
 # Runs in a private sub-interpreter (no shared="true"). Clean disable
 # depends on two things being in place:
 #   1. Domoticz core filtering _DummyThread out of PythonThreadCount()
@@ -22,7 +27,7 @@
 #      keeps a worker blocked in geckolib I/O from stalling the join.
 #
 """
-<plugin key="GeckoSpa" name="Gecko Spa / Hot Tub" author="GizMoCuz" version="2.1.0"
+<plugin key="GeckoSpa" name="Gecko Spa / Hot Tub" author="GizMoCuz" version="2.2.0"
         wikilink="https://wiki.domoticz.com/Plugins"
         externallink="https://github.com/gizmocuz/domoticz-gecko-spa">
     <description>
@@ -76,7 +81,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-import Domoticz
+import DomoticzEx as Domoticz
 
 try:
     from geckolib import GeckoAsyncSpaMan, GeckoSpaEvent, GeckoSpaState
@@ -91,7 +96,7 @@ else:
     _import_error = None
 
 # ---------------------------------------------------------------------------
-# Unit layout (single spa)
+# Unit layout (single spa, all under one DomoticzEx DeviceID = spa unique_id)
 # ---------------------------------------------------------------------------
 
 UNIT_THERMOSTAT = 1   # Combined Thermostat 6 (Type=73 Subtype=0): "temp;setpoint"
@@ -595,6 +600,9 @@ class BasePlugin:
         self._poll_interval = 3  # in heartbeats (10s each); set from Mode1 seconds at onStart
         self._heartbeat_count = 0
         self._devices_created = False
+        # DomoticzEx DeviceID for this spa. Set once the bridge reports the
+        # spa's unique identifier (e.g. "SPAe8:eb:1b:3b:b1:46").
+        self._device_id = None
         # Per-unit metadata for command dispatch and selector mode lookup:
         # unit -> {"kind": "pump"/"light"/"blower"/"watercare", "idx": int, "modes": [..]}
         self._unit_meta = {}
@@ -653,8 +661,8 @@ class BasePlugin:
         # Reflect connection state on the Gateway / Status devices once they exist
         if self._devices_created:
             connected = (snap.get("spa_state") == "CONNECTED")
-            _update(UNIT_GATEWAY, 1 if connected else 0, "On" if connected else "Off")
-            _update(UNIT_STATUS,  0, snap.get("spa_state") or "?")
+            self._update(UNIT_GATEWAY, 1 if connected else 0, "On" if connected else "Off")
+            self._update(UNIT_STATUS,  0, snap.get("spa_state") or "?")
 
         if not snap.get("ready"):
             return
@@ -662,13 +670,18 @@ class BasePlugin:
         if not self._devices_created:
             self._create_devices(snap)
             self._devices_created = True
+            # Push immediately so freshly created units land with real values
+            # (especially the Thermostat 6, which was seeded with "0;0") instead
+            # of waiting up to poll_interval-1 heartbeats for the first push.
+            self._force_next_push = True
 
         if self._force_next_push or (self._heartbeat_count % self._poll_interval == 0):
             self._force_next_push = False
             self._push_snapshot_to_devices(snap)
 
-    def onCommand(self, Unit, Command, Level, Hue):
-        Domoticz.Debug("onCommand Unit={} Command={} Level={}".format(Unit, Command, Level))
+    def onCommand(self, DeviceID, Unit, Command, Level, Color):
+        Domoticz.Debug("onCommand DeviceID={} Unit={} Command={} Level={}".format(
+            DeviceID, Unit, Command, Level))
         if self._bridge is None:
             return
         # Any successful command schedules a full snapshot push on the next
@@ -690,7 +703,7 @@ class BasePlugin:
             snap = self._bridge.snapshot()
             current = snap.get("water_temp")
             t = "{:.1f}".format(current) if current is not None else ""
-            _update(UNIT_THERMOSTAT, 0, "{};{:.1f}".format(t, temp))
+            self._update(UNIT_THERMOSTAT, 0, "{};{:.1f}".format(t, temp))
             return
 
         meta = self._unit_meta.get(Unit)
@@ -704,7 +717,7 @@ class BasePlugin:
         if kind == "light":
             on = (str(Command).strip().lower() == "on") or _level_to_index(Level) > 0
             self._bridge.set_light(idx, on)
-            _update(Unit, 1 if on else 0, "On" if on else "Off")
+            self._update(Unit, 1 if on else 0, "On" if on else "Off")
 
         elif kind in ("pump", "blower"):
             modes = meta.get("modes") or []
@@ -720,7 +733,7 @@ class BasePlugin:
                 self._bridge.set_pump(idx, mode)
             else:
                 self._bridge.set_blower(idx, mode)
-            _update(Unit, level_idx * 10, str(level_idx * 10))
+            self._update(Unit, level_idx * 10, str(level_idx * 10))
 
         elif kind == "watercare":
             modes = meta.get("modes") or []
@@ -729,78 +742,111 @@ class BasePlugin:
                 Domoticz.Error("Watercare level {} out of range (0..{})".format(level_idx, len(modes) - 1))
                 return
             self._bridge.set_watercare(level_idx)
-            _update(Unit, level_idx * 10, str(level_idx * 10))
+            self._update(Unit, level_idx * 10, str(level_idx * 10))
 
     def onConnect(self, *_):    pass
     def onMessage(self, *_):    pass
     def onDisconnect(self, *_): pass
     def onNotification(self, *_): pass
 
+    # --- device-dict helpers ---
+
+    def _unit(self, unit):
+        """Return the DomoticzEx Unit object for `unit`, or None if not created yet."""
+        if not self._device_id:
+            return None
+        dev = Devices.get(self._device_id)
+        if dev is None:
+            return None
+        return dev.Units.get(unit)
+
+    def _update(self, unit, nvalue, svalue):
+        u = self._unit(unit)
+        if u is None:
+            return
+        if u.nValue != nvalue or u.sValue != svalue:
+            # DomoticzEx: assign attributes on the Unit, then call Update() to flush.
+            # Update() itself only takes Log/TypeName/UpdateProperties/UpdateOptions/
+            # SuppressTriggers — not nValue/sValue (PythonObjectEx.cpp CUnitEx_update).
+            u.nValue = nvalue
+            u.sValue = svalue
+            u.Update()
+
     # --- device creation ---
 
     def _create_devices(self, snap):
-        # Device names use the SPA's own name (facade.name, e.g. "Home") as
-        # prefix, not the Domoticz hardware name. The facade name is set by
-        # the user in the in.touch app and identifies which physical spa
-        # the device belongs to.
+        # DomoticzEx groups Units under a Device keyed by DeviceID. We use the
+        # spa's stable identifier (e.g. "SPAe8:eb:1b:3b:b1:46") so re-pairing
+        # the same physical spa retains its devices, and so the plugin doesn't
+        # clash with other DomoticzEx-based plugins in the same interpreter.
+        device_id = snap.get("spa_id")
+        if not device_id:
+            Domoticz.Error("Cannot create devices: spa_id missing from snapshot.")
+            return
+        self._device_id = device_id
+
+        # Unit display names use the spa's own facade name (e.g. "Home") as
+        # prefix, set by the user in the in.touch app.
         spa = (snap.get("spa_name") or "Spa").strip() or "Spa"
         def _n(label):
             return "{} - {}".format(spa, label)
 
-        if UNIT_THERMOSTAT in Devices:
-            existing = Devices[UNIT_THERMOSTAT]
-            if existing.Type != THERMOSTAT6_TYPE or existing.SubType != THERMOSTAT6_SUBTYPE:
-                Domoticz.Error(
-                    "Unit {} exists but is not a Thermostat 6 device (Type={}, SubType={}). "
-                    "Delete it in Setup -> Devices and restart the hardware to migrate to the "
-                    "combined Thermostat 6 layout.".format(
-                        UNIT_THERMOSTAT, existing.Type, existing.SubType))
+        def _ensure(unit, initial_svalue=None, **kwargs):
+            existing = self._unit(unit)
+            if existing is not None:
+                return existing
+            u = Domoticz.Unit(DeviceID=device_id, Unit=unit, **kwargs)
+            # Devices without a TypeName mapping (e.g. Thermostat 6 created via
+            # numeric Type/SubType) skip maptypename's sValue defaults and would
+            # otherwise persist with an empty sValue, which some UIs render as
+            # "no data". Seed a sensible initial sValue before Create().
+            if initial_svalue is not None:
+                u.sValue = initial_svalue
+            u.Create()
+            return self._unit(unit)
+
+        thermo = self._unit(UNIT_THERMOSTAT)
+        if thermo is not None and (thermo.Type != THERMOSTAT6_TYPE or thermo.SubType != THERMOSTAT6_SUBTYPE):
+            Domoticz.Error(
+                "Unit {} exists but is not a Thermostat 6 device (Type={}, SubType={}). "
+                "Delete it in Setup -> Devices and restart the hardware to migrate to the "
+                "combined Thermostat 6 layout.".format(
+                    UNIT_THERMOSTAT, thermo.Type, thermo.SubType))
         else:
-            Domoticz.Device(Name=_n("Thermostat"),
-                            Unit=UNIT_THERMOSTAT,
-                            Type=THERMOSTAT6_TYPE,
-                            Subtype=THERMOSTAT6_SUBTYPE).Create()
-        if UNIT_HEATING not in Devices:
-            Domoticz.Device(Name=_n("Heating"), Unit=UNIT_HEATING, TypeName="Switch").Create()
+            _ensure(UNIT_THERMOSTAT, Name=_n("Thermostat"),
+                    Type=THERMOSTAT6_TYPE, SubType=THERMOSTAT6_SUBTYPE,
+                    initial_svalue="0;0")
+        _ensure(UNIT_HEATING, Name=_n("Heating"), TypeName="Switch")
 
         for i, p in enumerate(snap.get("pumps", [])):
             unit = UNIT_PUMP_BASE + i
             modes = p.get("modes") or ["OFF", "ON"]
             self._unit_meta[unit] = {"kind": "pump", "idx": i, "modes": modes}
-            if unit not in Devices:
-                Domoticz.Device(Name=_n(p.get("name") or "Pump {}".format(i + 1)),
-                                Unit=unit, TypeName="Selector Switch",
-                                Options=_selector_options(modes)).Create()
+            _ensure(unit, Name=_n(p.get("name") or "Pump {}".format(i + 1)),
+                    TypeName="Selector Switch", Options=_selector_options(modes))
 
         for i, l in enumerate(snap.get("lights", [])):
             unit = UNIT_LIGHT_BASE + i
             self._unit_meta[unit] = {"kind": "light", "idx": i}
-            if unit not in Devices:
-                Domoticz.Device(Name=_n(l.get("name") or "Light {}".format(i + 1)),
-                                Unit=unit, TypeName="Switch").Create()
+            _ensure(unit, Name=_n(l.get("name") or "Light {}".format(i + 1)),
+                    TypeName="Switch")
 
         for i, b in enumerate(snap.get("blowers", [])):
             unit = UNIT_BLOWER_BASE + i
             modes = b.get("modes") or ["OFF", "ON"]
             self._unit_meta[unit] = {"kind": "blower", "idx": i, "modes": modes}
-            if unit not in Devices:
-                Domoticz.Device(Name=_n(b.get("name") or "Blower {}".format(i + 1)),
-                                Unit=unit, TypeName="Selector Switch",
-                                Options=_selector_options(modes)).Create()
+            _ensure(unit, Name=_n(b.get("name") or "Blower {}".format(i + 1)),
+                    TypeName="Selector Switch", Options=_selector_options(modes))
 
         wc = snap.get("watercare") or {}
         wc_modes = wc.get("modes") or []
         if wc_modes:
             self._unit_meta[UNIT_WATERCARE] = {"kind": "watercare", "idx": 0, "modes": wc_modes}
-            if UNIT_WATERCARE not in Devices:
-                Domoticz.Device(Name=_n("Watercare"),
-                                Unit=UNIT_WATERCARE, TypeName="Selector Switch",
-                                Options=_selector_options(wc_modes)).Create()
+            _ensure(UNIT_WATERCARE, Name=_n("Watercare"),
+                    TypeName="Selector Switch", Options=_selector_options(wc_modes))
 
-        if UNIT_GATEWAY not in Devices:
-            Domoticz.Device(Name=_n("Gateway"), Unit=UNIT_GATEWAY, TypeName="Switch").Create()
-        if UNIT_STATUS not in Devices:
-            Domoticz.Device(Name=_n("Status"), Unit=UNIT_STATUS, TypeName="Text").Create()
+        _ensure(UNIT_GATEWAY, Name=_n("Gateway"), TypeName="Switch")
+        _ensure(UNIT_STATUS, Name=_n("Status"), TypeName="Text")
 
     # --- snapshot -> device updates ---
 
@@ -812,27 +858,27 @@ class BasePlugin:
             # Fall back to the other value if one side is briefly missing
             t = "{:.1f}".format(temp) if temp is not None else ""
             s = "{:.1f}".format(setp) if setp is not None else ""
-            _update(UNIT_THERMOSTAT, 0, "{};{}".format(t, s))
+            self._update(UNIT_THERMOSTAT, 0, "{};{}".format(t, s))
         if snap.get("heating") is not None:
-            _update(UNIT_HEATING, 1 if snap["heating"] else 0,
-                    "On" if snap["heating"] else "Off")
+            self._update(UNIT_HEATING, 1 if snap["heating"] else 0,
+                         "On" if snap["heating"] else "Off")
 
         for i, p in enumerate(snap.get("pumps", [])):
             unit = UNIT_PUMP_BASE + i
             modes = self._unit_meta.get(unit, {}).get("modes", [])
             level = _mode_to_level(p.get("mode"), modes)
-            _update(unit, level, str(level))
+            self._update(unit, level, str(level))
 
         for i, l in enumerate(snap.get("lights", [])):
             unit = UNIT_LIGHT_BASE + i
             on = bool(l.get("is_on"))
-            _update(unit, 1 if on else 0, "On" if on else "Off")
+            self._update(unit, 1 if on else 0, "On" if on else "Off")
 
         for i, b in enumerate(snap.get("blowers", [])):
             unit = UNIT_BLOWER_BASE + i
             modes = self._unit_meta.get(unit, {}).get("modes", [])
             level = _mode_to_level(b.get("mode"), modes)
-            _update(unit, level, str(level))
+            self._update(unit, level, str(level))
 
         wc = snap.get("watercare") or {}
         wc_meta = self._unit_meta.get(UNIT_WATERCARE)
@@ -842,7 +888,7 @@ class BasePlugin:
                 idx = modes.index(wc["mode"])
             except ValueError:
                 idx = wc.get("mode_idx") or 0
-            _update(UNIT_WATERCARE, idx * 10, str(idx * 10))
+            self._update(UNIT_WATERCARE, idx * 10, str(idx * 10))
 
 
 def _mode_to_level(current_mode, modes):
@@ -854,14 +900,6 @@ def _mode_to_level(current_mode, modes):
         return 0
 
 
-def _update(unit, nvalue, svalue):
-    if unit not in Devices:
-        return
-    d = Devices[unit]
-    if d.nValue != nvalue or d.sValue != svalue:
-        d.Update(nValue=nvalue, sValue=svalue)
-
-
 # ---------------------------------------------------------------------------
 # Domoticz entry points
 # ---------------------------------------------------------------------------
@@ -871,8 +909,8 @@ _plugin = BasePlugin()
 def onStart():        _plugin.onStart()
 def onStop():         _plugin.onStop()
 def onHeartbeat():    _plugin.onHeartbeat()
-def onCommand(Unit, Command, Level, Hue):
-    _plugin.onCommand(Unit, Command, Level, Hue)
+def onCommand(DeviceID, Unit, Command, Level, Color):
+    _plugin.onCommand(DeviceID, Unit, Command, Level, Color)
 def onConnect(*a):    _plugin.onConnect(*a)
 def onMessage(*a):    _plugin.onMessage(*a)
 def onDisconnect(*a): _plugin.onDisconnect(*a)
