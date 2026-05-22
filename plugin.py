@@ -226,24 +226,6 @@ class GeckoBridge:
             self._thread = None
 
     def _thread_main(self, spa_ip):
-        # Defensive: in a Domoticz Python sub-interpreter the asyncio
-        # thread-local "running loop" pointer can carry over stale state from
-        # a previous interpreter incarnation (observed on Python 3.13 with the
-        # post-shared=true sub-interpreter teardown). Without this, brand-new
-        # threading.Thread instances start with _get_running_loop() != None
-        # and our loop.run_until_complete() immediately raises "Cannot run the
-        # event loop while another loop is running".
-        try:
-            stale = asyncio.events._get_running_loop()
-        except Exception:
-            stale = None
-        if stale is not None:
-            Domoticz.Debug("bridge: clearing stale running-loop ref ({!r}) before start".format(stale))
-            try:
-                asyncio.events._set_running_loop(None)
-            except Exception as e:
-                Domoticz.Debug("bridge: _set_running_loop(None) raised {}".format(e))
-
         if sys.platform == "win32":
             # Proactor can't broadcast UDP; geckolib needs the selector loop on Windows.
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
