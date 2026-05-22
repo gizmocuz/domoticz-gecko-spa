@@ -47,8 +47,12 @@
             <options>
                 <option label="10 seconds" value="10"/>
                 <option label="30 seconds" value="30" default="true"/>
-                <option label="60 seconds" value="60"/>
-                <option label="120 seconds" value="120"/>
+                <option label="1 minute" value="60"/>
+                <option label="2 minutes" value="120"/>
+                <option label="3 minutes" value="180"/>
+                <option label="5 minutes" value="300"/>
+                <option label="10 minutes" value="600"/>
+                <option label="15 minutes" value="900"/>
             </options>
         </param>
         <param field="Mode6" label="Debug" width="150px">
